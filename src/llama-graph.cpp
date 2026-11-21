@@ -198,7 +198,10 @@ static int64_t llm_graph_n_tok_rows(const llama_ubatch & ubatch) {
 }
 
 bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
-    bool res = true;
+    // The graph statically picks the token-lookup or the direct-embedding branch when it is
+    // built. Shapes alone cannot tell them apart: an mtmd embedding batch and a token batch
+    // can both be 512 rows yet need different graphs. Refuse a cross-modality reuse.
+    bool res = use_tokens == (params.ubatch.token != nullptr);
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)  || (embd   &&   embd->ne[1] == params.ubatch.n_tokens);
@@ -238,7 +241,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
-    bool res = true;
+    // The graph statically picks the token-lookup or the direct-embedding branch when it is
+    // built. Shapes alone cannot tell them apart: an mtmd embedding batch and a token batch
+    // can both be 512 rows yet need different graphs. Refuse a cross-modality reuse.
+    bool res = use_tokens == (params.ubatch.token != nullptr);
 
     res &= (!params.ubatch.token)      || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
     res &= (!params.ubatch.embd)       || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
@@ -2809,7 +2815,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
 
     assert(n_embd_inp >= n_embd);
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp, ubatch.token != nullptr);
 
     // mixed path (ubatch.is_mixed()): set_rows the token rows into a copy of the embd rows, with its own inputs as select branches must not share tensors
     // TODO: use inp->tokens and inp->embd once ggml_build_forward_select allows it

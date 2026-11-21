@@ -106,7 +106,7 @@ ggml_tensor * llama_model_eagle3::graph<true>::build_inp_embd_enc() const {
 
     // Input: Target model features (3 layers concatenated: low, mid, high)
     // Data will be provided via ubatch->embd in encode_eagle3_features()
-    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc());
+    auto inp_target = std::make_unique<llm_graph_input_embd>(hparams.n_embd_inp_enc(), ubatch.token != nullptr);
     inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp_enc(), n_tokens);
     ggml_set_input(inp_target->embd);
 
@@ -170,7 +170,7 @@ llama_model_eagle3::graph<false>::graph(const llm_graph_params & params) : llm_g
         tok_embd = model_other->tok_embd;
     }
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd, ubatch.token != nullptr);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);

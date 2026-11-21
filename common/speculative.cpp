@@ -1,5 +1,7 @@
 #include "speculative.h"
 
+#include "../src/llama-ext.h"
+
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
@@ -1825,6 +1827,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    struct lagged_batch {
+        llama_tokens tokens;
+        std::vector<llama_pos> pos;
+        std::vector<float> h_carry;
+        int32_t source_begin = -1;
+
+        bool empty() const { return tokens.empty(); }
+
+        void clear() {
+            tokens.clear();
+            pos.clear();
+            h_carry.clear();
+            source_begin = -1;
+        }
+    };
+
+    // At most one logical target decode is pending per sequence. Its rows live in the target
+    // context's previous pinned-host slot; tokens/positions and the cross-batch carry are owned
+    // here so the MTP catch-up can be built after the next target decode has already started.
+    std::vector<lagged_batch> lagged;
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1834,6 +1857,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     bool    dev_rows    = false;
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+
+    // multi-device target with a two-slot pinned-host nextn ring: the catch-up lags one batch
+    // behind the target, see flush_lagged(). mutually exclusive with dev_rows
+    bool    nextn_ring  = false;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -1909,19 +1936,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+        lagged.resize(n_seq);
 
         n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
         verify_row0.assign(n_seq, -1);
 
-        // shared memory and chained heads keep the host rows
-        if (!is_mem_shared && !chain_heads) {
+        // layer-split targets lose their pipeline overlap when process() waits for the current
+        // nextn rows before returning, halving prompt throughput (issue #27428). keep the rows
+        // in a two-slot host ring and lag the catch-up one batch instead
+        if (!is_mem_shared && llama_model_n_devices(llama_get_model(ctx_tgt)) > 1) {
+            llama_set_embeddings_nextn_buffered(ctx_tgt, true);
+            nextn_ring = true;
+        }
+
+        // shared memory, chained heads and the lagged host ring keep the host rows
+        if (!is_mem_shared && !chain_heads && !nextn_ring) {
             dev_rows = llama_set_embeddings_nextn_dev(ctx_tgt, true) && llama_set_ctx_state_src(ctx_dft, ctx_tgt);
             if (!dev_rows) {
                 llama_set_ctx_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
             }
         }
-        SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
+        SPC_TRC("- target h rows on the device: %s, lagged host ring: %s\n",
+                dev_rows ? "yes" : "no", nextn_ring ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1951,6 +1988,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        {
+            std::vector<bool> selected(n_seq, false);
+            selected[seq_id] = true;
+            if (!flush_lagged(selected, /*current=*/ true)) {
+                SPC_ERR("failed to flush final prefill batch for seq_id=%d\n", (int) seq_id);
+                return;
+            }
+        }
+
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
@@ -1963,9 +2009,140 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // Build and run the MTP catch-up for whatever is parked in `lagged`.
+    // current=false reads the target PREVIOUS pinned-host slot: its D2H event is already
+    // recorded, so draining it does not synchronize the target decode still in flight.
+    // That is the whole point -- waiting on the CURRENT slot forces the target ubatch to
+    // finish and stops the second GPU from starting the next one, which is what halves
+    // prompt processing on a layer split (upstream issue #27428).
+    bool flush_lagged(const std::vector<bool> & selected, bool current) {
+        bool have_work = false;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            have_work = have_work || (selected[seq_id] && !lagged[seq_id].empty());
+        }
+        if (!have_work) {
+            return true;
+        }
+
+        auto * ctx_tgt = this->params.ctx_tgt;
+        auto * ctx_dft = this->params.ctx_dft;
+
+        const float * h_tgt = current
+            ? llama_get_embeddings_nextn(ctx_tgt)
+            : llama_get_embeddings_nextn_previous(ctx_tgt);
+        if (h_tgt == nullptr) {
+            SPC_ERR("%s target nextn buffer is unavailable\n", current ? "current" : "previous");
+            return false;
+        }
+
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
+        batch.clear();
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & lag = lagged[seq_id];
+            if (!selected[seq_id] || lag.empty()) {
+                continue;
+            }
+
+            const int32_t n_rows = (int32_t) lag.tokens.size();
+            GGML_ASSERT(n_rows > 0);
+            GGML_ASSERT((int32_t) lag.pos.size() == n_rows);
+            GGML_ASSERT(lag.h_carry.size() == (size_t) n_embd);
+            GGML_ASSERT(lag.source_begin >= 0);
+
+            verify_h_rows[seq_id] = n_rows;
+            verify_h[seq_id].resize((size_t) n_rows * n_embd);
+            std::memcpy(verify_h[seq_id].data(),
+                    h_tgt + (size_t) lag.source_begin * n_embd,
+                    (size_t) n_rows * row_bytes);
+
+            // target hidden rows are shifted right by one: row i of the MTP batch consumes the
+            // target row i-1, and row 0 consumes the carry from the previous logical batch
+            for (int32_t i = 0; i < n_rows; ++i) {
+                const int32_t idx = batch.add(lag.tokens[i], lag.pos[i], seq_id, false);
+
+                const float * h_row = i == 0
+                    ? lag.h_carry.data()
+                    : verify_h[seq_id].data() + (size_t) (i - 1) * n_embd;
+
+                batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
+            }
+        }
+
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        bool ok = true;
+        {
+            // this decode only advances the MTP K/V, so run the KV-only graph
+            struct scoped_mtp_kv_only {
+                llama_context * ctx;
+
+                explicit scoped_mtp_kv_only(llama_context * ctx) : ctx(ctx) {
+                    llama_set_mtp_kv_only(ctx, true);
+                }
+
+                ~scoped_mtp_kv_only() {
+                    llama_set_mtp_kv_only(ctx, false);
+                }
+            } guard(ctx_dft);
+
+            for (int head = 0; head < n_mtp_layers; ++head) {
+                if (chain_heads) {
+                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                        auto & lag = lagged[seq_id];
+                        if (!selected[seq_id] || lag.empty()) {
+                            continue;
+                        }
+                        llama_memory_seq_rm(mem_dft, seq_id, lag.pos[0], -1);
+                    }
+                    llama_set_nextn_layer_offset(ctx_dft, head);
+                }
+
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (rc != 0) {
+                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d\n", head, (int) rc);
+                    ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (chain_heads) {
+            llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+        if (!ok) {
+            return false;
+        }
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & lag = lagged[seq_id];
+            if (!selected[seq_id] || lag.empty()) {
+                continue;
+            }
+
+            std::memcpy(pending_h[seq_id].data(),
+                    verify_h[seq_id].data() + (size_t) (verify_h_rows[seq_id] - 1) * n_embd,
+                    row_bytes);
+            lag.clear();
+        }
+
+        return true;
+    }
+
+    bool flush_lagged(bool current) {
+        return flush_lagged(std::vector<bool>(n_seq, true), current);
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
+        }
+
+        // Decode N has already selected the other target output slot. Drain N-1 from its own
+        // event before that slot can be reused; importantly, this does NOT synchronize decode N.
+        if (nextn_ring && !flush_lagged(/*current=*/ false)) {
+            return false;
         }
 
         if (!batch_in.has_token() && !batch_in.has_embd()) {
@@ -1990,9 +2167,60 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         auto * ctx_tgt = this->params.ctx_tgt;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+
         auto * ctx_dft = this->params.ctx_dft;
 
-        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        // park each seq run so the next process() catches up the MTP K/V from the target's
+        // previous slot while the next target decode is already in flight (issue #27428).
+        // a run that sampling reads this turn flushes immediately. runs holding vision rows
+        // cannot ride the lag path and fall through to the synchronous path below
+        bool ring_vision = false;
+
+        if (nextn_ring) {
+            std::vector<bool> immediate(n_seq, false);
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const int32_t i_beg = i_batch_beg[seq_id];
+                const int32_t i_end = i_batch_end[seq_id];
+                if (i_beg < 0) {
+                    continue;
+                }
+
+                GGML_ASSERT(lagged[seq_id].empty());
+
+                auto & lag = lagged[seq_id];
+
+                for (int32_t i = i_beg; i <= i_end; ++i) {
+                    const auto & t = batch_in.tokens[i];
+
+                    GGML_ASSERT(t.seq_id == seq_id &&
+                            "MTP requires each sequence to occupy one contiguous batch run");
+
+                    // Intermediate prompt chunks request no logits, so nothing reads them this
+                    // turn and they can lag. The final prompt chunk and every generation batch do
+                    // request logits, so they stay on the synchronous path sampling needs.
+                    immediate[seq_id] = immediate[seq_id] || t.output;
+                    ring_vision = ring_vision || t.id == LLAMA_TOKEN_NULL || t.embd.data != nullptr;
+
+                    lag.tokens.push_back(t.id);
+                    lag.pos.push_back(t.pos[0]);
+                }
+
+                lag.h_carry = pending_h[seq_id];
+                lag.source_begin = i_beg;
+            }
+
+            if (!ring_vision) {
+                // never leave a batch that sampling needs parked in the lag slot
+                return flush_lagged(immediate, /*current=*/ true);
+            }
+
+            // vision rows need the synchronous path below, drop what was just parked
+            for (auto & lag : lagged) {
+                lag.clear();
+            }
+        }
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -2107,10 +2335,29 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (h_rows - 1) * n_embd, row_bytes);
         }
 
+        // a vision decode ran on the target in the embedding graph topology and moved the ring
+        // phase. force a re-reserve before the next text batch, or every later prefill in this
+        // process stays on the serial slow path
+        if (ring_vision) {
+            llama_reset_after_external_decode(ctx_tgt);
+        }
+
         return true;
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        // the MTP K/V must be fully caught up before any draft is built
+        {
+            std::vector<bool> pending_for_draft(n_seq, false);
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                pending_for_draft[seq_id] = dparams[seq_id].drafting;
+            }
+            if (!flush_lagged(pending_for_draft, /*current=*/ true)) {
+                SPC_ERR("%s", "failed to flush MTP state before drafting\n");
+                return;
+            }
+        }
+
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();

@@ -132,7 +132,7 @@ using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
-    llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
+    llm_graph_input_embd(int64_t n_embd, bool use_tokens = true) : n_embd(n_embd), use_tokens(use_tokens) {}
     virtual ~llm_graph_input_embd() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -150,12 +150,13 @@ public:
     float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
+    const bool use_tokens = false;
 };
 
 // similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
-    llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_state) : n_embd(n_embd), n_embd_state(n_embd_state) {}
+    llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_state, bool use_tokens = true) : n_embd(n_embd), n_embd_state(n_embd_state), use_tokens(use_tokens) {}
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -169,6 +170,7 @@ public:
 
     const int64_t n_embd       = 0;
     const int64_t n_embd_state = 0;
+    const bool use_tokens = false;
 };
 
 // original batch index of each ubatch token, used as set_rows destination rows
@@ -956,6 +958,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.mtp_kv_only             == other.cparams.mtp_kv_only             &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&

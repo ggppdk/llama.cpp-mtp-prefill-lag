@@ -139,6 +139,20 @@ enum llama_decision_order {
 // The embeddings output has one value per entry: row i is the score of option i
 LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch, int32_t idx, enum llama_decision_order order);
 
+// Use a K/V-only MTP graph during prompt catch-up. Unsupported models ignore this mode.
+LLAMA_API void llama_set_mtp_kv_only(struct llama_context * ctx, bool value);
+
+// Enable a two-slot pinned-host output ring for unmasked nextn rows. Internal staging API for
+// MTP: the previous decode can be consumed without synchronizing the current one.
+LLAMA_API void llama_set_embeddings_nextn_buffered(struct llama_context * ctx, bool value);
+
+// Synchronize and reset the phase of the buffered nextn ring without disabling it.
+// Used after target decodes that bypass the speculative pipeline.
+LLAMA_API void llama_reset_after_external_decode(struct llama_context * ctx);
+
+// Wait only for the previous slot's D2H event, not for the context's current graph.
+LLAMA_API float * llama_get_embeddings_nextn_previous(struct llama_context * ctx);
+
 // Questions packed after a shared state in one sequence, contexts without memory only
 // 0 (default) is the state, k > 0 the k-th question; full attention layers hide other questions from a question
 LLAMA_API bool llama_batch_ext_set_decision_group(struct llama_batch_ext * batch, int32_t idx, int32_t group);

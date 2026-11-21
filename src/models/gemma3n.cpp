@@ -316,7 +316,7 @@ ggml_tensor * llama_model_gemma3n::graph::calc_magnitude(ggml_tensor * x) {
 // equivalent to get_per_layer_inputs() in python code
 // output shape: [n_embd_altup, n_layer, n_tokens]
 ggml_tensor * llama_model_gemma3n::graph::build_inp_per_layer() {
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd, ubatch.token != nullptr);
     ggml_tensor * inp_per_layer;
     float tok_embd_scale = sqrtf((float) n_embd_altup);
     // mixed ubatch: embd rows have token id 0, same padding row as below

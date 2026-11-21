@@ -89,7 +89,7 @@ llama_model_gemma4_assistant::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_embd;
     ggml_tensor * inp_h;
     {
-        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd_backbone, n_embd_backbone);
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd_backbone, n_embd_backbone, ubatch.token != nullptr);
 
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
         cb(inp->tokens, "inp_tokens", -1);

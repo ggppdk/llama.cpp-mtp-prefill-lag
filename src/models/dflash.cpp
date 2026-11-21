@@ -173,7 +173,7 @@ void llama_model_dflash::load_tensors_layers_base() {
 template <>
 ggml_tensor * llama_model_dflash::graph<true>::build_inp_embd_enc() const {
     const int64_t n_embd_inp = hparams.n_embd_inp_enc();
-    auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    auto inp_target = std::make_unique<llm_graph_input_embd>(n_embd_inp, ubatch.token != nullptr);
 
     inp_target->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
     ggml_set_input(inp_target->embd);
@@ -224,7 +224,7 @@ static ggml_tensor * build_inp_target_features(llm_graph_context & g, llm_graph_
 ggml_tensor * llama_model_dflash::build_inject_inp(llm_graph_context & g, const llama_model & model) {
     const int64_t n_embd_inp = g.hparams.n_embd_inp_enc();
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp, g.ubatch.token != nullptr);
 
     ggml_tensor * inp_target = build_inp_target_features(g, *inp, n_embd_inp);
     g.cb(inp_target, "inp_target_features", -1);
@@ -360,7 +360,7 @@ ggml_tensor * llama_model_dflash::graph_base::build_inp_tokens() {
     ggml_set_input(inp_tokens);
     res->t_inp_tokens = inp_tokens;
 
-    auto inp = std::make_unique<llm_graph_input_embd>(n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd>(n_embd, ubatch.token != nullptr);
     inp->tokens = inp_tokens;
     res->add_input(std::move(inp));
 

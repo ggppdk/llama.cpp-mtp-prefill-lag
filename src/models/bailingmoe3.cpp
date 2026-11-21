@@ -399,7 +399,7 @@ llama_model_bailingmoe3::graph_mtp::graph_mtp(const llm_graph_params & params) :
     const int64_t kv_lora_rank = hparams.n_lora_kv;
     const float kq_scale = 1.0f / sqrtf((float) qk_head_dim);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd, ubatch.token != nullptr);
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);

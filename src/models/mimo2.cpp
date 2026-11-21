@@ -267,7 +267,7 @@ llama_model_mimo2::graph_mtp::graph_mtp(const llm_graph_params & params)
 
     const float v_scale      = hparams.f_attn_value_scale;
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd, ubatch.token != nullptr);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);

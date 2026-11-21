@@ -260,7 +260,7 @@ llama_model_dflash::graph_lilicorr::graph_lilicorr(const llm_graph_params & para
         res->t_inp_tokens = inp_tokens;
 
         // inp_anchor passes the context features to the lattice scorer
-        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd);
+        auto inp = std::make_unique<llm_graph_input_embd_h>(n_embd, n_embd, ubatch.token != nullptr);
         inp->tokens = inp_tokens;
         inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
         ggml_set_input(inp->h);
